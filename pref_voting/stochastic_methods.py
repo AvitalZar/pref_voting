@@ -99,11 +99,12 @@ def MLRaDiUS(profile, curr_cands=None):
         return [RaDiUS.choose(profile, curr_cands=curr_cands, beta=beta)]
 
 @vm(name="Randomized Grade Calibrated Ranking")
-def RGCR(gprofile, curr_cands=None):
+def RGCR(gprofile, w=(lambda x: x/(1+x)), curr_cands=None):
     
     """
-    An implementation of the cardinal ranking estimator proposed by Wang and Shah in https://arxiv.org/abs/1806.05085.
-
+    An implementation of the cardinal ranking estimator proposed by Wang and Shah (2018) in https://arxiv.org/abs/1806.05085.
+    by Avital Zar, 2026-04-21
+    
     Args:
         gprofile: A profile of linear orders with associated cardinal scores (a GProfile).
         curr_cands: A list of candidates to consider. Defaults to all candidates if not provided.
@@ -113,14 +114,12 @@ def RGCR(gprofile, curr_cands=None):
 
     .. code block:: python
         # Example usage:
-        from pref_voting.profile import GProfile
+        from pref_voting.grade_profiles import GradeProfile
         from pref_voting.stochastic_methods import RGCR
 
         # Create a GProfile with 2 voters and 3 candidates
-        gprofile = GProfile()
-        gprofile.add_vote([1, 0], [0.8, 0.4])  # Voter 1 prefers candidate 1 > 0 with scores 0.8, 0.4
-        gprofile.add_vote([1, 2], [0.6, 0.2])  # Voter 2 prefers candidate 1 > 2 with scores 0.6, 0.2
-
+        gprofile = GradeProfile([{1: 4, 2: 8}, {2: 6, 3: 2}], range(0, 10), candidates=[1, 2, 3])
+        
         # Get the ranking using RGCR
         ranking = RGCR(gprofile)
         print(ranking)
