@@ -103,12 +103,14 @@ def test_strict_uniform_dominance(estimator):
     rgcr_success = 0
     another_estimator_success = 0
     trials = 1000
-    for _ in range(trials):
-        gprofile = create_random_legal_gprofile()
+    for i in range(trials):
+        items = np.random.randint(i,100*i)
+        voters = np.random.randint(int(items/5), 5*items)
+        gprofile = create_random_legal_gprofile(size=items, num_voters=voters)
         rgcr_ranking = RGCR(gprofile)
         another_ranking = estimator(gprofile)
-        if rgcr_ranking == [4, 3, 2, 1, 0]: # the true order is always 0 < 1 < 2 < 3 < 4
+        if rgcr_ranking == list(range(items)).reverse(): # the true order is always 0 < 1 < ...
             rgcr_success += 1
-        if another_ranking == [4, 3, 2, 1, 0]:
+        if another_ranking == list(range(items)).reverse():
             another_estimator_success += 1
     assert rgcr_success > another_estimator_success
