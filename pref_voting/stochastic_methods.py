@@ -14,6 +14,7 @@ from networkx import topological_sort, is_directed_acyclic_graph, DiGraph, find_
 import math
 import logging
 import time
+import itertools
 from sortedcontainers import SortedDict
 
 @vm(name="Random Consensus Builder (Stochastic)")
@@ -124,6 +125,7 @@ def RGCR(gprofile:GradeProfile, w=(lambda x: x/(1+x)), curr_cands=None):
     w_results = SortedDict()
 
     candidates = curr_cands if curr_cands is not None else gprofile.candidates
+    candidates_set = set(candidates)
     logger.info("Starting RGCR with candidates: %s", candidates)
 
     def _ranking_graph(gprofile:GradeProfile):
@@ -132,29 +134,45 @@ def RGCR(gprofile:GradeProfile, w=(lambda x: x/(1+x)), curr_cands=None):
         
         GB = DiGraph()
         GB.add_nodes_from(gprofile.candidates)
-        gmap = [g.mapping for g in gprofile._grades]
-        for i in range(len(gmap)): #TODO: Improve by using itertools.
-            voter = gmap[i]
-            voter_sorted_cands = sorted(voter.keys(), key=lambda c: voter[c], reverse=True)
-            for j in range(len(voter_sorted_cands)-1):
-                for k in range(j+1, len(voter_sorted_cands)):
-                    c1 = voter_sorted_cands[j]
-                    c2 = voter_sorted_cands[k]
-                    if c1 in candidates and c2 in candidates and voter[c1] != voter[c2]:
-                        GB.add_edge(c1, c2)
-                        
+        edges = set()
+        for g in gprofile._grades:
+            voter = [(cand, score) for cand, score in g.mapping.items() if cand in candidates_set]
+            for (cand1, score1), (cand2, score2) in itertools.combinations(voter,2):
+                if score1 > score2:
+                    edge = (cand1, cand2)
+                elif score2 > score1:
+                    edge = (cand2,cand1)
+                else:
+                    continue
+                edges.add(edge)
+        GB.add_edges_from(edges)
         rg_end_time = time.perf_counter()
         logger.info("PERF: _ranking_graph execution time: %.6f seconds", rg_end_time - rg_start_time)
         return GB
     
     # This part isn't in the paper, the contrary - the paper says that ties broken is in order of the indices of the items.
     # However, such an arrangement creates a large bias in favor of the given order of candidates, which hurts the probability.
-    setup_start_time = time.perf_counter()
+    setup_total_start = time.perf_counter()
+    
+    # 1. Extracting mappings
+    t0 = time.perf_counter()
     gmap = [g.mapping for g in gprofile._grades]
+    t_extract = time.perf_counter() - t0
+    logger.info("PERF [Setup]: Extracting mappings took %.6f seconds", t_extract)
+    
+    # 2. Shuffling
+    t0 = time.perf_counter()
     random.shuffle(gmap)
+    t_shuffle = time.perf_counter() - t0
+    logger.info("PERF [Setup]: Shuffling took %.6f seconds", t_shuffle)
+    
+    # 3. Creating GradeProfile copy
+    t0 = time.perf_counter()
     Y = GradeProfile(gmap, gprofile.grades, candidates = candidates) # Create a copy of the evaluations to avoid modifying the original one.
-    B = Y.to_ranking_profile() # The ordinaly ranking
-    logger.info("PERF: Initial setup and profile copying took %.6f seconds", time.perf_counter() - setup_start_time)
+    t_grade_profile = time.perf_counter() - t0
+    logger.info("PERF [Setup]: Creating GradeProfile (Y) took %.6f seconds", t_grade_profile)
+
+    logger.info("PERF: Initial setup TOTAL took %.6f seconds", time.perf_counter() - setup_total_start)
     
     GB = _ranking_graph(Y) # The graph g(B) which represent the ordinal ranking.
     
@@ -166,7 +184,7 @@ def RGCR(gprofile:GradeProfile, w=(lambda x: x/(1+x)), curr_cands=None):
         logger.error("Cycle detected in majority graph: %s", cycle_str)
         raise ValueError("As the algorithm assumes, there can't be cycles in voting order.")
     ordering = list(topological_sort(GB)) # Maybe the ties break could be more efficient
-    ordering = [c for c in ordering if c in set(candidates)] # Remove candidates not in curr_cands
+    ordering = [c for c in ordering if c in candidates_set] # Remove candidates not in curr_cands
     logger.info("PERF: DAG check and topological sort took %.6f seconds", time.perf_counter() - graph_ops_start)
     
     logger.debug("Initial topological ordering: %s", ordering)
@@ -240,10 +258,10 @@ def RGCR(gprofile:GradeProfile, w=(lambda x: x/(1+x)), curr_cands=None):
         if t_reviewer and t_plus_1_reviewer:
             # Measure majority_prefers
             t0 = time.perf_counter()
-            majority_pref_result = B.majority_prefers(t_th_item, t_plus_1_th_item)
+            GB_has_edge = GB.has_edge(t_th_item, t_plus_1_th_item)
             time_in_majority_prefers += (time.perf_counter() - t0)
             
-            if not majority_pref_result:
+            if not GB_has_edge:
                 t_score = t_reviewer.val(t_th_item)
                 t_plus_1_score = t_plus_1_reviewer.val(t_plus_1_th_item)
 
