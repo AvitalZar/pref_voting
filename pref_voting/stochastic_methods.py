@@ -10,11 +10,12 @@ from pref_voting.voting_method import *
 from pref_voting.iterative_methods import consensus_builder
 from pref_voting.probabilistic_methods import maximal_lottery, RaDiUS
 from pref_voting.grade_profiles import GradeProfile
-from networkx import topological_sort, is_directed_acyclic_graph, DiGraph, find_cycle
+import networkx as nx
 import math
 import logging
 import time
 import itertools
+import igraph as ig
 from sortedcontainers import SortedDict
 
 @vm(name="Random Consensus Builder (Stochastic)")
@@ -131,21 +132,34 @@ def RGCR(gprofile:GradeProfile, w=(lambda x: x/(1+x)), curr_cands=None):
     def _ranking_graph(gprofile:GradeProfile):
         # Helper function to create the ranking graph from the GProfile.
         rg_start_time = time.perf_counter()
-        
-        GB = DiGraph()
-        GB.add_nodes_from(gprofile.candidates)
-        edges = set()
+        print("Ahhhhhhhh!!!!")
+
+        num_candidates = len(candidates)
+        pairwise_matrix = np.zeros((num_candidates, num_candidates), dtype=np.int8)
+        cands_dict = {cand:i for i,cand in enumerate(candidates)}
+        print("Boom")
         for g in gprofile._grades:
-            voter = [(cand, score) for cand, score in g.mapping.items() if cand in candidates_set]
-            for (cand1, score1), (cand2, score2) in itertools.combinations(voter,2):
-                if score1 > score2:
-                    edge = (cand1, cand2)
-                elif score2 > score1:
-                    edge = (cand2,cand1)
-                else:
-                    continue
-                edges.add(edge)
-        GB.add_edges_from(edges)
+            voter = [(cands_dict[cand], score) for cand, score in g.mapping.items() if cand in candidates_set] # A generator, to prevent collapse in big input
+            if not voter:
+                continue
+            indices = np.array([item[0] for item in voter], dtype=np.int32)
+            scores = np.array([item[1] for item in voter], dtype=np.float32)
+
+            wins_matrix = scores[:, None] > scores[None, :]
+            pairwise_matrix[np.ix_(indices, indices)] |= wins_matrix.astype(np.int8)
+
+        sources, targets = np.where(pairwise_matrix > 0)
+
+        GB = ig.Graph(directed=True)
+        GB.add_vertices(num_candidates)
+        GB.vs["name"] = candidates
+
+
+        batch_size = 1_000_000
+        for i in range(0, len(sources), batch_size):
+            batch_edges = list(zip(sources[i:i+batch_size], targets[i:i+batch_size]))
+            GB.add_edges(batch_edges)
+        print("Ouch")
         rg_end_time = time.perf_counter()
         logger.info("PERF: _ranking_graph execution time: %.6f seconds", rg_end_time - rg_start_time)
         return GB
@@ -177,13 +191,16 @@ def RGCR(gprofile:GradeProfile, w=(lambda x: x/(1+x)), curr_cands=None):
     GB = _ranking_graph(Y) # The graph g(B) which represent the ordinal ranking.
     
     graph_ops_start = time.perf_counter()
-    if not is_directed_acyclic_graph(GB): # Then someone ranked a higher-ranked item lower, in contrast to the paper's assumption.
-        cycle = find_cycle(GB)
+    if not GB.is_dag(): # Then someone ranked a higher-ranked item lower, in contrast to the paper's assumption.
+        nx_GB = GB.to_networkx()
+        nx_GB = nx.relabel_nodes(nx_GB, nx.get_node_attributes(nx_GB, 'name'))
+        cycle = nx.find_cycle(nx_GB)
         nodes = [u for u, v in cycle] + [cycle[-1][1]]
         cycle_str = " -> ".join(str(node) for node in nodes)
         logger.error("Cycle detected in majority graph: %s", cycle_str)
         raise ValueError("As the algorithm assumes, there can't be cycles in voting order.")
-    ordering = list(topological_sort(GB)) # Maybe the ties break could be more efficient
+    topo_indices = GB.topological_sorting()
+    ordering = GB.vs[topo_indices]["name"]
     ordering = [c for c in ordering if c in candidates_set] # Remove candidates not in curr_cands
     logger.info("PERF: DAG check and topological sort took %.6f seconds", time.perf_counter() - graph_ops_start)
     
@@ -258,7 +275,9 @@ def RGCR(gprofile:GradeProfile, w=(lambda x: x/(1+x)), curr_cands=None):
         if t_reviewer and t_plus_1_reviewer:
             # Measure majority_prefers
             t0 = time.perf_counter()
-            GB_has_edge = GB.has_edge(t_th_item, t_plus_1_th_item)
+            v1 = GB.vs.find(name=t_th_item)
+            v2 = GB.vs.find(name=t_plus_1_th_item)
+            GB_has_edge = GB.are_adjacent(v1,v2)
             time_in_majority_prefers += (time.perf_counter() - t0)
             
             if not GB_has_edge:
