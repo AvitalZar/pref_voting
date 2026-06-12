@@ -122,24 +122,20 @@ def RGCR(gprofile:GradeProfile, w=(lambda x: x/(1+x)), curr_cands=None):
         A sorted list of candidates.
     """
     
-    total_start_time = time.perf_counter()
     w_results = SortedDict()
 
     candidates = curr_cands if curr_cands is not None else gprofile.candidates
     candidates_set = set(candidates)
     logger.info("Starting RGCR with candidates: %s", candidates)
 
-    def _ranking_graph(gprofile:GradeProfile):
+    def _ranking_graph(voters):
         # Helper function to create the ranking graph from the GProfile.
-        rg_start_time = time.perf_counter()
-        print("Ahhhhhhhh!!!!")
 
         num_candidates = len(candidates)
         pairwise_matrix = np.zeros((num_candidates, num_candidates), dtype=np.int8)
         cands_dict = {cand:i for i,cand in enumerate(candidates)}
-        print("Boom")
-        for g in gprofile._grades:
-            voter = [(cands_dict[cand], score) for cand, score in g.mapping.items() if cand in candidates_set] # A generator, to prevent collapse in big input
+        for v in voters:
+            voter = [(cands_dict[cand], score) for cand, score in v.items() if cand in candidates_set] # A generator, to prevent collapse in big input
             if not voter:
                 continue
             indices = np.array([item[0] for item in voter], dtype=np.int32)
@@ -154,59 +150,37 @@ def RGCR(gprofile:GradeProfile, w=(lambda x: x/(1+x)), curr_cands=None):
         GB.add_vertices(num_candidates)
         GB.vs["name"] = candidates
 
-
         batch_size = 1_000_000
         for i in range(0, len(sources), batch_size):
             batch_edges = list(zip(sources[i:i+batch_size], targets[i:i+batch_size]))
             GB.add_edges(batch_edges)
-        print("Ouch")
-        rg_end_time = time.perf_counter()
-        logger.info("PERF: _ranking_graph execution time: %.6f seconds", rg_end_time - rg_start_time)
         return GB
     
+
+    gmap = [g.mapping for g in gprofile._grades]
+
     # This part isn't in the paper, the contrary - the paper says that ties broken is in order of the indices of the items.
     # However, such an arrangement creates a large bias in favor of the given order of candidates, which hurts the probability.
-    setup_total_start = time.perf_counter()
-    
-    # 1. Extracting mappings
-    t0 = time.perf_counter()
-    gmap = [g.mapping for g in gprofile._grades]
-    t_extract = time.perf_counter() - t0
-    logger.info("PERF [Setup]: Extracting mappings took %.6f seconds", t_extract)
-    
-    # 2. Shuffling
-    t0 = time.perf_counter()
     random.shuffle(gmap)
-    t_shuffle = time.perf_counter() - t0
-    logger.info("PERF [Setup]: Shuffling took %.6f seconds", t_shuffle)
-    
-    # 3. Creating GradeProfile copy
-    t0 = time.perf_counter()
-    Y = GradeProfile(gmap, gprofile.grades, candidates = candidates) # Create a copy of the evaluations to avoid modifying the original one.
-    t_grade_profile = time.perf_counter() - t0
-    logger.info("PERF [Setup]: Creating GradeProfile (Y) took %.6f seconds", t_grade_profile)
 
-    logger.info("PERF: Initial setup TOTAL took %.6f seconds", time.perf_counter() - setup_total_start)
+    GB = _ranking_graph(gmap) # The graph g(B) which represent the ordinal ranking.
     
-    GB = _ranking_graph(Y) # The graph g(B) which represent the ordinal ranking.
-    
-    graph_ops_start = time.perf_counter()
     if not GB.is_dag(): # Then someone ranked a higher-ranked item lower, in contrast to the paper's assumption.
-        nx_GB = GB.to_networkx()
-        nx_GB = nx.relabel_nodes(nx_GB, nx.get_node_attributes(nx_GB, 'name'))
-        cycle = nx.find_cycle(nx_GB)
-        nodes = [u for u, v in cycle] + [cycle[-1][1]]
-        cycle_str = " -> ".join(str(node) for node in nodes)
-        logger.error("Cycle detected in majority graph: %s", cycle_str)
+        if len(candidates) < 5000 or len(gmap) < 50:
+            nx_GB = GB.to_networkx()
+            nx_GB = nx.relabel_nodes(nx_GB, nx.get_node_attributes(nx_GB, 'name'))
+            cycle = nx.find_cycle(nx_GB)
+            nodes = [u for u, v in cycle] + [cycle[-1][1]]
+            cycle_str = " -> ".join(str(node) for node in nodes)
+            logger.error("Cycle detected in majority graph: %s", cycle_str)
         raise ValueError("As the algorithm assumes, there can't be cycles in voting order.")
     topo_indices = GB.topological_sorting()
     ordering = GB.vs[topo_indices]["name"]
     ordering = [c for c in ordering if c in candidates_set] # Remove candidates not in curr_cands
-    logger.info("PERF: DAG check and topological sort took %.6f seconds", time.perf_counter() - graph_ops_start)
     
     logger.debug("Initial topological ordering: %s", ordering)
 
-    def _our_can(tuple):
+    def decide_flipping(tuple):
         # Helper random function which get two scores and return true if the first score probablistically beats the second.
         w_result = check_w(abs(tuple[0]-tuple[1]))
         prob = (1+w_result)/2 # The probability that the higher-ranked item is really better.
@@ -214,14 +188,14 @@ def RGCR(gprofile:GradeProfile, w=(lambda x: x/(1+x)), curr_cands=None):
         if tuple[0] < tuple[1]: # If the second one is bigger, then in probability 1-prob we return true because in probability 1-prob the first beats the second.
             result = not result
 
-        logger.debug("our_can: scores %s, prob %.4f -> flip: %g", tuple, round(prob, 4), result)
+        logger.debug("decide_flipping: scores %s, prob %.4f -> flip: %g", tuple, round(prob, 4), result)
         return result
 
     def _find_reviewer(item):
         # Helper function which finds a random voter who graded the given item.
         reviewer = None
-        for voter in Y._grades:
-            if voter.has_grade(item) and voter.val(item) is not None:
+        for voter in gmap:
+            if item in voter:
                 reviewer = voter
                 break
         return reviewer
@@ -248,25 +222,15 @@ def RGCR(gprofile:GradeProfile, w=(lambda x: x/(1+x)), curr_cands=None):
         logger.debug("Checked w(%g) = %g", argument, w_res)
         return w_res
 
-    # Performance accumulators for the main loop
-    time_in_find_reviewer = 0.0
-    time_in_majority_prefers = 0.0
-    time_in_list_removals = 0.0
-    time_in_our_can = 0.0
-    loop_start_time = time.perf_counter()
 
     t = 0
     while(t < len(ordering)-1):
         t_th_item = ordering[t]
         t_plus_1_th_item = ordering[t+1]
-
         logger.debug("Checking pair: (%s, %s) at index %g", t_th_item, t_plus_1_th_item, t)
 
-        # Measure _find_reviewer
-        t0 = time.perf_counter()
         t_reviewer = _find_reviewer(t_th_item)
         t_plus_1_reviewer = _find_reviewer(t_plus_1_th_item)
-        time_in_find_reviewer += (time.perf_counter() - t0)
 
         # If the flipping of t and t+1 isn't a topological order, means there's no one who ranked t above t+1
         # Also if there's a reviewing for both items
@@ -274,31 +238,25 @@ def RGCR(gprofile:GradeProfile, w=(lambda x: x/(1+x)), curr_cands=None):
         
         if t_reviewer and t_plus_1_reviewer:
             # Measure majority_prefers
-            t0 = time.perf_counter()
             v1 = GB.vs.find(name=t_th_item)
             v2 = GB.vs.find(name=t_plus_1_th_item)
             GB_has_edge = GB.are_adjacent(v1,v2)
-            time_in_majority_prefers += (time.perf_counter() - t0)
             
             if not GB_has_edge:
-                t_score = t_reviewer.val(t_th_item)
-                t_plus_1_score = t_plus_1_reviewer.val(t_plus_1_th_item)
+                t_score = t_reviewer[t_th_item]
+                t_plus_1_score = t_plus_1_reviewer[t_plus_1_th_item]
 
                 logger.debug("Pair satisfies flip conditions. Scores: %s=%g, %s=%g", t_th_item, t_score, t_plus_1_th_item, t_plus_1_score)
 
                 # Measure list removals (can be O(N) and slow for large lists)
-                t0 = time.perf_counter()
-                Y._grades.remove(t_reviewer)
-                if(t_plus_1_reviewer in Y._grades): # In case we choose the same reviewer for both items.
-                    Y._grades.remove(t_plus_1_reviewer)
-                time_in_list_removals += (time.perf_counter() - t0)
+                gmap.remove(t_reviewer)
+                if(t_plus_1_reviewer in gmap): # In case we choose the same reviewer for both items, when he gave both the same score.
+                    gmap.remove(t_plus_1_reviewer)
                 
                 # Measure _our_can (and inner check_w)
-                t0 = time.perf_counter()
-                our_can_result = _our_can((t_plus_1_score, t_score))
-                time_in_our_can += (time.perf_counter() - t0)
+                flipping_result = decide_flipping((t_plus_1_score, t_score))
                 
-                if our_can_result: # If the second item ranked higher, the we flip them.
+                if flipping_result: # If the second item ranked higher, the we flip them.
                     logger.debug("Flipping %s and %s", t_th_item, t_plus_1_th_item)
                     ordering[t], ordering[t+1] = ordering[t+1], ordering[t]
                 t = t+2
@@ -308,19 +266,6 @@ def RGCR(gprofile:GradeProfile, w=(lambda x: x/(1+x)), curr_cands=None):
         else:
             logger.debug("Skipping pair: missing reviewers.")
             t = t+1
-            
-    loop_end_time = time.perf_counter()
-    total_end_time = time.perf_counter()
-
-    # Final Profiling Report
-    logger.info("=== RGCR Performance Profiling Report ===")
-    logger.info("Total execution time: %.6f seconds", total_end_time - total_start_time)
-    logger.info("Main while loop total time: %.6f seconds", loop_end_time - loop_start_time)
-    logger.info("  -> Time spent in _find_reviewer: %.6f seconds", time_in_find_reviewer)
-    logger.info("  -> Time spent in majority_prefers: %.6f seconds", time_in_majority_prefers)
-    logger.info("  -> Time spent in Y._grades.remove(): %.6f seconds", time_in_list_removals)
-    logger.info("  -> Time spent in _our_can (+ check_w): %.6f seconds", time_in_our_can)
-    logger.info("=========================================")
 
     logger.info("Final RGCR ranking: %s", ordering)
     return ordering
