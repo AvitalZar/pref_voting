@@ -28,6 +28,7 @@ filelock = "^3.12.2"
 preflibtools = "^2.0.22"
 seaborn = "^0.13.2"
 pathos = "^0.3.3"
+sortedcontainers
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.3.5"
